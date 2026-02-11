@@ -1,0 +1,146 @@
+name: 📡 SonarCloud Analysis
+on:
+  push:
+    branches: ["**"]
+    paths-ignore:
+      - '.github/workflows/**'
+      - '.github/codeql-config.yml'
+      - 'sonar-project.properties'
+      - '.snyk'
+  pull_request:
+    branches: ["**"]
+    paths-ignore:
+      - '.github/workflows/**'
+      - '.github/codeql-config.yml'
+      - 'sonar-project.properties'
+      - '.snyk'
+  workflow_dispatch:
+
+jobs:
+  sonar-scan:
+    name: SonarCloud Scan
+    runs-on: ubuntu-latest
+    continue-on-error: false
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Set up JDK 21
+      uses: actions/setup-java@v4
+      with:
+        java-version: '21'
+        distribution: 'temurin'
+
+    - name: Set up Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '20'
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.x'
+
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: 'stable'
+        cache: false
+
+    - name: Install & Setup Build Wrapper (for C/C++)
+      run: |
+        curl -sSLo build-wrapper.zip "https://sonarcloud.io/static/cpp/build-wrapper-linux-x86.zip"
+        unzip -o build-wrapper.zip
+        echo "$PWD/build-wrapper-linux-x86" >> $GITHUB_PATH
+
+    - name: Smart Build & Detection (Dynamic)
+      id: smart_build
+      continue-on-error: true
+      run: |
+        # --- INIZIALIZZAZIONE SICURA ---
+        # Default a "." per evitare crash su stringhe vuote
+        SONAR_BINARIES="."
+        SONAR_ARGS=""
+
+        echo "::group::Auto-Detection Logic"
+
+        # --- JAVA (Maven/Gradle) ---
+        # Se trova Java, prova a compilare.
+        if [ -f "pom.xml" ]; then
+          mvn package -DskipTests || true
+        elif [ -f "build.gradle" ] || [ -f "build.gradle.kts" ]; then
+          chmod +x gradlew || true
+          ./gradlew assemble -x test || true
+        fi
+
+        # Cerca le classi compilate (FIXED LOGIC)
+        # Usa find e controlla se la stringa è vuota DOPO
+        FOUND_CLASSES=$(find . -type d \( -name "classes" -o -name "test-classes" \) | tr '\n' ',')
+
+        if [ -n "$FOUND_CLASSES" ]; then
+             # Rimuove l'ultima virgola se presente
+             SONAR_BINARIES="${FOUND_CLASSES%,}"
+             echo "✅ Found Java binaries: $SONAR_BINARIES"
+        else
+             echo "⚠️ No compiled classes found. Defaulting binaries to '.' (Source analysis only)"
+             SONAR_BINARIES="."
+        fi
+
+        # --- NODE / JS ---
+        if [ -f "package.json" ]; then
+          npm install --ignore-scripts || true
+        fi
+
+        # --- PYTHON ---
+        if [ -f "requirements.txt" ]; then
+           pip install -r requirements.txt || true
+        fi
+
+        # --- C/C++ DYNAMIC HANDLING ---
+        HAS_CPP=false
+        WRAPPER_OUT="bw-output"
+
+        # Tenta build C++ solo se trova i file di configurazione
+        if [ -f "Makefile" ]; then
+            build-wrapper-linux-x86-64 --out-dir $WRAPPER_OUT make clean all || true
+            HAS_CPP=true
+        elif [ -f "CMakeLists.txt" ]; then
+            mkdir -p build_wrapper_tmp
+            cd build_wrapper_tmp
+            cmake .. || true
+            cd ..
+            build-wrapper-linux-x86-64 --out-dir $WRAPPER_OUT cmake --build build_wrapper_tmp || true
+            HAS_CPP=true
+        fi
+
+        if [ "$HAS_CPP" = "true" ] && [ -f "$WRAPPER_OUT/compile_commands.json" ]; then
+            echo "✅ C/C++ compilation database generated."
+            SONAR_ARGS="$SONAR_ARGS -Dsonar.cfamily.compile-commands=$WRAPPER_OUT/compile_commands.json"
+        else
+            # IMPORTANTE: Se non c'è build wrapper, DISABILITA i sensori C++
+            # Altrimenti SonarScanner va in crash se trova file .cpp ma non sa come compilarli
+            echo "ℹ️ Disabling C/C++ sensors to prevent analysis errors."
+            SONAR_ARGS="$SONAR_ARGS -Dsonar.c.file.suffixes=- -Dsonar.cpp.file.suffixes=- -Dsonar.objc.file.suffixes=-"
+        fi
+
+        echo "::endgroup::"
+
+        # Esporta le variabili in modo sicuro (Multiline support non necessario qui ma buona pratica)
+        echo "SONAR_BINARIES=$SONAR_BINARIES" >> $GITHUB_ENV
+        echo "SONAR_ARGS=$SONAR_ARGS" >> $GITHUB_ENV
+
+    - name: SonarCloud Scan
+      uses: sonarsource/sonarqube-scan-action@v6
+      continue-on-error: false
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+      with:
+        # Args passati in modo pulito. Notare le virgolette intorno alle variabili env
+        args: >
+          ${{ env.SONAR_ARGS }}
+          -Dsonar.java.binaries=${{ env.SONAR_BINARIES }}
+          -Dsonar.qualitygate.wait=true

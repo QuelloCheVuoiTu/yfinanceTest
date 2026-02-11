@@ -1,0 +1,296 @@
+name: 🔍 CodeQL Analysis
+on:
+  push:
+    branches: ["**"]
+    paths-ignore:
+      - '.github/workflows/**'
+      - '.github/codeql-config.yml'
+      - 'sonar-project.properties'
+      - '.snyk'
+  pull_request:
+    branches: ["**"]
+    paths-ignore:
+      - '.github/workflows/**'
+      - '.github/codeql-config.yml'
+      - 'sonar-project.properties'
+      - '.snyk'
+  workflow_dispatch:
+
+jobs:
+  check-languages:
+    name: Detect Languages
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.languages }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Auto-detect Project Languages
+        id: set-matrix
+        run: |
+          python3 -c '
+          import os
+          import json
+          mapping = {
+              ".py": "python",
+              ".js": "javascript", ".ts": "javascript", ".jsx": "javascript", ".tsx": "javascript",
+              ".java": "java",
+              ".go": "go",
+              ".cs": "csharp",
+              ".cpp": "cpp", ".c": "cpp", ".h": "cpp", ".cc": "cpp", ".cxx": "cpp",
+              ".rb": "ruby",
+              ".swift": "swift"
+          }
+          mode_map = {
+              "java": "none", "csharp": "autobuild", "python": "none", 
+              "javascript": "none", "ruby": "none", 
+              "go": "autobuild", "cpp": "autobuild", "swift": "autobuild"
+          }
+          found_languages = set()
+          try:
+              for root, dirs, files in os.walk("."):
+                  dirs[:] = [d for d in dirs if not d.startswith(".") and d not in ["node_modules", "dist", "build", "vendor"]]
+                  for file in files:
+                      ext = os.path.splitext(file)[1].lower()
+                      if ext in mapping:
+                          found_languages.add(mapping[ext])
+          except Exception:
+              pass
+
+          # Fallback se non trova nulla
+          if not found_languages:
+              print("::warning::No supported languages found via extension check.")
+
+          matrix_list = []
+          sorted_langs = sorted(list(found_languages))
+          for lang in sorted_langs:
+              mode = mode_map.get(lang, "autobuild")
+              matrix_list.append({"language": lang, "build-mode": mode})
+
+          output_json = json.dumps(matrix_list)
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"languages={output_json}\n")
+          '
+
+  analyze:
+    needs: check-languages
+    if: ${{ needs.check-languages.outputs.matrix != '[]' && needs.check-languages.outputs.matrix != '' }}
+    name: Analyze
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs.check-languages.outputs.matrix) }}
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Set up JDK 21
+      uses: actions/setup-java@v4
+      with:
+        java-version: '21'
+        distribution: 'temurin'
+
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: 'stable'
+        cache: false
+
+    - name: Initialize CodeQL
+      uses: github/codeql-action/init@v4
+      with:
+        languages: ${{ matrix.language }}
+        build-mode: ${{ matrix.build-mode }}
+        queries: security-and-quality
+
+
+    - name: Make build scripts executable
+      if: ${{ matrix.build-mode == 'autobuild' }}
+      run: chmod +x gradlew mvnw || true
+
+    - name: Autobuild
+      if: ${{ matrix.build-mode == 'autobuild' }}
+      uses: github/codeql-action/autobuild@v4
+      continue-on-error: true
+
+    - name: Perform CodeQL Analysis
+      uses: github/codeql-action/analyze@v4
+      continue-on-error: true
+      with:
+        category: "/language:${{matrix.language}}"
+        output: sarif-results
+
+    - name: Generate Report & Check Status
+      if: always()
+      env:
+        # QUI STA LA FIX: Passiamo la lingua come variabile d'ambiente
+        CURRENT_LANG: ${{ matrix.language }}
+        BLOCKING_ENABLED: "True"
+        IGNORED_RULES_JSON: '[]'
+      run: |
+        python3 -c "
+        import json
+        import os
+        import sys
+
+        # --- RECUPERO VARIABILI SICURO ---
+        # Leggiamo dall'ambiente. Non può fallire con NameError.
+        current_lang = os.environ.get('CURRENT_LANG', 'unknown')
+        blocking_enabled = os.environ.get('BLOCKING_ENABLED') == 'True'
+
+        ignored_json_str = os.environ.get('IGNORED_RULES_JSON', '[]')
+        try:
+            ignored_rules = json.loads(ignored_json_str)
+        except:
+            ignored_rules = []
+
+        print(f'::notice::Language: {current_lang}')
+        print(f'::notice::Blocking Enabled: {blocking_enabled}')
+
+        # Cerca il file SARIF
+        sarif_files = []
+        for root, dirs, files in os.walk('sarif-results'):
+            for file in files:
+                if file.endswith('.sarif'):
+                    sarif_files.append(os.path.join(root, file))
+
+        sarif_path = sarif_files[0] if sarif_files else None
+        html_path = f'codeql-report-{current_lang}.html'
+
+        # Iniziamo l'HTML base
+        html_content = '''<html><head><title>CodeQL Report</title><style>body{font-family:sans-serif;padding:20px;background:#0d1117;color:#c9d1d9} table{border-collapse:collapse;width:100%} th,td{border:1px solid #30363d;padding:8px;text-align:left} th{background:#161b22} .error{color:#ff7b72} .warning{color:#d29922} .critical{color:#ff7b72;font-weight:bold} .high{color:#ff7b72} .medium{color:#d29922} .low{color:#c9d1d9}</style></head><body><h1>CodeQL Analysis Report</h1>'''
+
+        findings_count = 0
+        analysis_failed = False
+
+        # --- PARSING SARIF ---
+        if sarif_path and os.path.exists(sarif_path):
+            try:
+                print(f'::notice::Parsing SARIF: {sarif_path}')
+                with open(sarif_path, 'r') as f:
+                    data = json.load(f)
+
+                results = []
+                rules_map = {}
+
+                for run in data.get('runs', []):
+                    # Mappa le regole
+                    tool_rules = run.get('tool', {}).get('driver', {}).get('rules', [])
+                    for r in tool_rules:
+                        if 'id' in r: rules_map[r['id']] = r
+
+                    run_results = run.get('results', [])
+
+                    for res in run_results:
+                        rule_id = res.get('ruleId', 'N/A')
+
+                        # WHITELIST: Salta regole ignorate dall'utente
+                        if rule_id in ignored_rules:
+                            print(f'::notice::Skipping ignored rule: {rule_id}')
+                            continue
+
+                        # Se arriviamo qui, il problema è REALE e NON IGNORATO
+                        findings_count += 1
+
+                        rule = rules_map.get(rule_id, {})
+                        props = rule.get('properties', {})
+                        sec_sev_str = props.get('security-severity', '0')
+
+                        try:
+                            severity_score = float(sec_sev_str)
+                        except:
+                            severity_score = 0.0
+
+                        display_sev = 'Low'
+                        if severity_score >= 9.0: display_sev = 'Critical'
+                        elif severity_score >= 7.0: display_sev = 'High'
+                        elif severity_score >= 4.0: display_sev = 'Medium'
+
+                        res['_display_sev'] = display_sev
+                        results.append(res)
+
+                        # Logga il problema nella console di GitHub Actions
+                        print(f'::warning::Found issue: {rule_id} (Severity: {display_sev})')
+
+                # Generazione HTML Table
+                html_content += f'<h3>Total Findings: {findings_count}</h3>'
+                html_content += '<table><tr><th>Rule</th><th>Severity</th><th>Message</th><th>Location</th></tr>'
+                for res in results:
+                    rule_id = res.get('ruleId', 'N/A')
+                    msg = res.get('message', {}).get('text', '')
+                    display_sev = res.get('_display_sev', 'Medium')
+
+                    loc = 'Unknown'
+                    if res.get('locations'):
+                        loc_obj = res['locations'][0].get('physicalLocation', {})
+                        uri = loc_obj.get('artifactLocation', {}).get('uri', '')
+                        line = loc_obj.get('region', {}).get('startLine', 0)
+                        loc = f'{uri}:{line}'
+
+                    cls = 'medium'
+                    if display_sev == 'Critical': cls = 'critical'
+                    elif display_sev == 'High': cls = 'high'
+                    elif display_sev == 'Low': cls = 'low'
+
+                    html_content += f'<tr class="{cls}"><td>{rule_id}</td><td>{display_sev}</td><td>{msg}</td><td>{loc}</td></tr>'
+                html_content += '</table>'
+
+            except Exception as e:
+                print(f'::error::Error parsing SARIF: {e}')
+                analysis_failed = True
+        else:
+            # Caso in cui CodeQL è crashato prima di produrre il SARIF
+            html_content += '<p style="color:#ff7b72"><strong>Analysis Failed:</strong> No SARIF results were produced.</p>'
+            print('::error::CodeQL Analysis failed to produce results (No SARIF file found).')
+            analysis_failed = True
+
+        html_content += '</body></html>'
+
+        # Scrittura del Report HTML
+        try:
+            with open(html_path, 'w') as f:
+                f.write(html_content)
+            print(f'::notice::Report generated: {html_path}')
+        except Exception as e:
+            print(f'::error::Failed to write HTML report: {e}')
+
+        # --- LOGICA DI BLOCCO FINALE ---
+
+        # 1. Se l'analisi è fallita tecnicamente (nessun SARIF prodotto)
+        if analysis_failed:
+             print('::error::BLOCKING PIPELINE: Analysis crashed or failed to init.')
+             # Se il blocking è ON, falliamo. Se è OFF, tecnicamente l'analisi è fallita comunque, quindi meglio uscire con errore.
+             # Ma rispettiamo la logica utente:
+             if blocking_enabled:
+                 sys.exit(1)
+             else:
+                 print('::warning::Analysis failed but blocking is disabled. Exiting gently.')
+                 sys.exit(0)
+
+        # 2. Se abbiamo trovato vulnerabilità attive
+        if findings_count > 0:
+            if blocking_enabled:
+                print(f'::error::BLOCKING PIPELINE: Found {findings_count} active issues! (Block enabled)')
+                sys.exit(1)
+            else:
+                print(f'::warning::Found {findings_count} active issues but blocking is DISABLED. Pipeline continues.')
+                sys.exit(0)
+
+        print('::notice::Analysis passed. No issues found.')
+        sys.exit(0)
+        "
+
+    - name: Upload HTML Report
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: codeql-report-${{ matrix.language }}
+        path: codeql-report-${{ matrix.language }}.html

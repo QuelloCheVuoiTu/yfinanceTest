@@ -1,0 +1,164 @@
+name: 🐶 Snyk Security
+on:
+  push:
+    branches: ["**"]
+    paths-ignore:
+      - '.github/workflows/**'
+      - '.github/codeql-config.yml'
+      - 'sonar-project.properties'
+      - '.snyk'
+  pull_request:
+    branches: ["**"]
+    paths-ignore:
+      - '.github/workflows/**'
+      - '.github/codeql-config.yml'
+      - 'sonar-project.properties'
+      - '.snyk'
+  workflow_dispatch:
+
+jobs:
+  snyk-scan:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Set up JDK 21
+      uses: actions/setup-java@v4
+      with:
+        java-version: '21'
+        distribution: 'temurin'
+
+    - name: Set up Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '20'
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.x'
+
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: 'stable'
+        cache: false
+
+    - name: Install Snyk CLI & Reporter
+      run: |
+        npm install -g snyk snyk-to-html
+
+    - name: Authenticate Snyk
+      env:
+        SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+      run: snyk auth $SNYK_TOKEN
+
+    - name: Snyk Security Scan (Generate Reports)
+      continue-on-error: true
+      run: |
+        
+        # 0. Smart Build & Install (CRITICAL for Snyk)
+        if [ -f "pom.xml" ]; then
+          echo "Compiling Java (Maven)..."
+          mvn package -DskipTests || true
+        fi
+
+        if [ -f "build.gradle" ] || [ -f "build.gradle.kts" ]; then
+          echo "Compiling Java (Gradle)..."
+          chmod +x gradlew || true
+          ./gradlew assemble -x test || true
+        fi
+
+        if [ -f "package.json" ]; then
+           echo "Installing Node deps..."
+           npm install || true
+        fi
+
+        if [ -f "requirements.txt" ]; then
+           echo "Installing Python deps..."
+           pip install -r requirements.txt || true
+        fi
+
+        # 1. Run Snyk & Generate JSON (Human Readable)
+        echo "Running Snyk JSON Scan..."
+        snyk test --all-projects --policy-path=.snyk --severity-threshold=medium --json > snyk-results.json || true
+
+        # 2. Run Snyk & Generate SARIF (Code Scanning)
+        echo "Running Snyk SARIF Scan..."
+        snyk test --all-projects --policy-path=.snyk --severity-threshold=medium --sarif-file-output=snyk.sarif || true
+
+        # 3. Convert JSON to HTML for artifact
+        if [ -f "snyk-results.json" ]; then
+            cat snyk-results.json | snyk-to-html -o snyk-report.html || echo "HTML generation failed"
+        fi
+    
+
+    - name: Upload HTML Report
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: snyk-security-report
+        path: snyk-report.html
+
+    - name: Upload JSON Report (For Dashboard)
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: snyk-results-json
+        path: snyk-results.json
+
+    - name: Upload SARIF to GitHub Code Scanning
+      if: always()
+      uses: github/codeql-action/upload-sarif@v4
+      with:
+        sarif_file: snyk.sarif
+        category: snyk
+
+    - name: Check Status & Block
+      if: always()
+      run: |
+        
+        python3 -c "
+        import json, sys, os
+        try:
+           # Check if SARIF was created (if not, Snyk likely crashed/failed execution)
+           if not os.path.exists('snyk.sarif'):
+               print('::error::Snyk failed to run correctly (No SARIF generated). Check logs for build errors.')
+               # Always fail if tool execution failed
+               sys.exit(1)
+
+           # Check the JSON results for blocking based on vulnerabilities
+           found_vulns = False
+           if os.path.exists('snyk-results.json'):
+               with open('snyk-results.json') as f:
+                   try:
+                       data = json.load(f)
+                       projects = data if isinstance(data, list) else [data]
+                       for p in projects:
+                           if p.get('uniqueCount', 0) > 0:
+                               found_vulns = True
+                               break
+                   except:
+                       pass
+
+           # Use the fail_build toggle to determine exit code for VULNERABILITIES
+           if found_vulns and 'true' == 'true':
+               print('::error::Blocking Pipeline: Snyk found security vulnerabilities!')
+               sys.exit(1)
+           elif found_vulns:
+               print('::warning::Snyk found vulnerabilities (Blocking Disabled via Toggle)')
+               sys.exit(0)
+           else:
+               print('::notice::No vulnerabilities found.')
+               sys.exit(0)
+
+        except Exception as e:
+           print(f'::error::Script error: {e}')
+           sys.exit(1)
+        "
+    
